@@ -1,0 +1,154 @@
+name: Cross-Platform LLVM Engine + Sysroots
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build LLVM on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ==========================
+      # 1. Install Dependencies
+      # ==========================
+      - name: Install Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y ninja-build cmake build-essential git curl mingw-w64 pkg-config libssl-dev ccache zip
+      
+      - name: Install Dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          choco install -y cmake ninja git mingw ccache zip
+      
+      - name: Install Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja git ccache
+
+      # ==========================
+      # 2. Setup Caching
+      # ==========================
+      - name: Restore Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.ccache
+            ~/AppData/Local/ccache
+          key: ${{ runner.os }}-llvm-cache-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-llvm-cache-
+
+      # ==========================
+      # 3. Prepare Sysroots
+      # ==========================
+      - name: Build Linux musl sysroot
+        if: runner.os == 'Linux'
+        run: |
+          git clone --depth=1 https://github.com/ifduyue/musl
+          cd musl
+          ./configure --prefix=$PWD/../sysroot-linux
+          make -j$(nproc)
+          make install
+
+      - name: Prepare Windows MinGW sysroot
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $PathsToTry = @("C:\mingw64", "C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64", "C:\tools\mingw64")
+          foreach ($path in $PathsToTry) {
+              if (Test-Path "$path\bin") {
+                  mkdir sysroot-windows -Force
+                  Copy-Item -Path "$path\*" -Destination "sysroot-windows" -Recurse -Force
+                  break
+              }
+          }
+
+      - name: Prepare macOS SDK sysroot
+        if: runner.os == 'macOS'
+        run: |
+          SDK_PATH=$(xcrun --show-sdk-path)
+          mkdir -p sysroot-macos
+          cp -R "$SDK_PATH/" sysroot-macos/
+
+      # ==========================
+      # 4. Clone & Build LLVM
+      # ==========================
+      - name: Clone LLVM
+        run: git clone --depth=1 https://github.com/llvm/llvm-project.git
+
+      - name: Build LLVM Engine
+        shell: bash
+        run: |
+          mkdir -p build && cd build
+          cmake -G Ninja ../llvm-project/llvm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;WebAssembly" \
+            -DLLVM_BUILD_TOOLS=ON \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_INSTALL_PREFIX=../install
+          ninja install
+
+      # ==========================
+      # 5. Package into ZIP
+      # ==========================
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p pkg/llvm
+          cp -r install/* pkg/llvm/
+          [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
+          [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
+          [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
+          zip -r llvm-engine-${{ matrix.os }}.zip pkg/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-engine-${{ matrix.os }}
+          path: llvm-engine-${{ matrix.os }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-files
+          merge-multiple: true
+
+      - name: Create Auto-Incremented Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find last tag or start at llvm0
+          LATEST_TAG=$(gh release list --limit 1 | awk '{print $1}')
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_TAG="llvm1"
+          else
+            NUMBER=$(echo $LATEST_TAG | sed 's/llvm//')
+            NEW_NUMBER=$((NUMBER + 1))
+            NEW_TAG="llvm$NEW_NUMBER"
+          fi
+          
+          gh release create "$NEW_TAG" ./release-files/*.zip \
+            --title "LLVM Engine Build ($NEW_TAG)" \
+            --notes "Automated build with cross-platform sysroots."
+            
