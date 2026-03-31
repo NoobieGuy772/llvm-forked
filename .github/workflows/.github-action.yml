@@ -34,7 +34,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install cmake ninja git ccache
-
+      
       # ==========================
       # 2. Setup Caching
       # ==========================
@@ -48,7 +48,7 @@ jobs:
           key: ${{ runner.os }}-llvm-cache-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-llvm-cache-
-
+      
       # ==========================
       # 3. Prepare Sysroots
       # ==========================
@@ -60,7 +60,7 @@ jobs:
           ./configure --prefix=$PWD/../sysroot-linux
           make -j$(nproc)
           make install
-
+      
       - name: Prepare Windows MinGW sysroot
         if: runner.os == 'Windows'
         shell: powershell
@@ -73,14 +73,27 @@ jobs:
                   break
               }
           }
-
+      
       - name: Prepare macOS SDK sysroot
         if: runner.os == 'macOS'
         run: |
           SDK_PATH=$(xcrun --show-sdk-path)
           mkdir -p sysroot-macos
-          cp -R "$SDK_PATH/" sysroot-macos/
-
+          
+          # Use rsync with --copy-links to resolve symlinks and avoid cycles
+          rsync -a --copy-links \
+            --exclude='*.swiftmodule' \
+            --exclude='*.framework/Versions/*/Headers/ruby/ruby' \
+            "$SDK_PATH/" sysroot-macos/ || true
+          
+          # Clean up any remaining circular symlinks
+          find sysroot-macos -type l -exec bash -c '
+            target=$(readlink -f "$1" 2>/dev/null)
+            if [[ -z "$target" ]] || [[ ! -e "$target" ]]; then
+              rm -f "$1"
+            fi
+          ' _ {} \;
+      
       # ==========================
       # 4. Clone & Build LLVM
       # ==========================
@@ -100,7 +113,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX=../install
           ninja install
-
+      
       # ==========================
       # 5. Package into ZIP
       # ==========================
@@ -113,7 +126,7 @@ jobs:
           [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
           [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
           zip -r llvm-engine-${{ matrix.os }}.zip pkg/
-
+      
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -151,4 +164,3 @@ jobs:
           gh release create "$NEW_TAG" ./release-files/*.zip \
             --title "LLVM Engine Build ($NEW_TAG)" \
             --notes "Automated build with cross-platform sysroots."
-            
