@@ -23,20 +23,20 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y ninja-build cmake build-essential git curl mingw-w64 pkg-config libssl-dev ccache zip
-      
+
       - name: Install Dependencies (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          choco install -y cmake ninja git mingw ccache zip
-      
+          choco install -y cmake ninja git mingw ccache zip llvm
+
       - name: Install Dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install cmake ninja git ccache
-      
+
       # ==========================
-      # 2. Setup Caching
+      # 2. Cache
       # ==========================
       - name: Restore Cache
         uses: actions/cache@v4
@@ -45,12 +45,12 @@ jobs:
             ~/.cache/ccache
             ~/.ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-llvm-cache-${{ github.run_id }}
+          key: ${{ runner.os }}-llvm-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-llvm-cache-
-      
+            ${{ runner.os }}-llvm-
+
       # ==========================
-      # 3. Prepare Sysroots
+      # 3. Sysroots
       # ==========================
       - name: Build Linux musl sysroot
         if: runner.os == 'Linux'
@@ -60,107 +60,146 @@ jobs:
           ./configure --prefix=$PWD/../sysroot-linux
           make -j$(nproc)
           make install
-      
+
       - name: Prepare Windows MinGW sysroot
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $PathsToTry = @("C:\mingw64", "C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64", "C:\tools\mingw64")
-          foreach ($path in $PathsToTry) {
-              if (Test-Path "$path\bin") {
-                  mkdir sysroot-windows -Force
-                  Copy-Item -Path "$path\*" -Destination "sysroot-windows" -Recurse -Force
-                  break
-              }
+          $paths = @("C:\mingw64","C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64","C:\tools\mingw64")
+          foreach ($p in $paths) {
+            if (Test-Path "$p\bin") {
+              mkdir sysroot-windows -Force
+              Copy-Item "$p\*" "sysroot-windows" -Recurse -Force
+              break
+            }
           }
-      
-      - name: Prepare macOS SDK sysroot
+
+      - name: Prepare macOS sysroot
         if: runner.os == 'macOS'
         run: |
-          SDK_PATH=$(xcrun --show-sdk-path)
-          mkdir -p sysroot-macos
-          
-          # Use rsync with --copy-links to resolve symlinks and avoid cycles
-          rsync -a --copy-links \
-            --exclude='*.swiftmodule' \
-            --exclude='*.framework/Versions/*/Headers/ruby/ruby' \
-            "$SDK_PATH/" sysroot-macos/ || true
-          
-          # Clean up any remaining circular symlinks
-          find sysroot-macos -type l -exec bash -c '
-            target=$(readlink -f "$1" 2>/dev/null)
-            if [[ -z "$target" ]] || [[ ! -e "$target" ]]; then
-              rm -f "$1"
-            fi
-          ' _ {} \;
-      
+          SDK=$(xcrun --show-sdk-path)
+          mkdir sysroot-macos
+          rsync -a --copy-links "$SDK/" sysroot-macos/ || true
+
       # ==========================
-      # 4. Clone & Build LLVM
+      # 4. Clone LLVM
       # ==========================
       - name: Clone LLVM
         run: git clone --depth=1 https://github.com/llvm/llvm-project.git
 
-      - name: Build LLVM Engine
+      # ==========================
+      # 5. Build LLVM (NO CLANG)
+      # ==========================
+      - name: Build LLVM
         shell: bash
         run: |
-          mkdir -p build && cd build
+          mkdir build && cd build
+
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="lld" \
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;WebAssembly" \
+            -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" \
             -DLLVM_BUILD_TOOLS=ON \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLD_BUILD_TOOLS=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX=../install
+
           ninja install
-      
+
       # ==========================
-      # 5. Package into ZIP
+      # 6. Strip Binaries
       # ==========================
-      - name: Package
+      - name: Strip (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          find install/bin -type f -exec strip --strip-all {} + || true
+
+      - name: Strip (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-ChildItem install/bin/*.exe | ForEach-Object {
+            strip $_.FullName
+          }
+
+      # ==========================
+      # 7. Toolchains (Cross Linking)
+      # ==========================
+      - name: Create Toolchains
         shell: bash
         run: |
-          mkdir -p pkg/llvm
+          mkdir -p pkg/toolchains pkg/sysroots pkg/llvm
+
           cp -r install/* pkg/llvm/
-          [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
-          [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
-          [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
+
+          [ -d sysroot-linux ] && mv sysroot-linux pkg/sysroots/linux-musl
+          [ -d sysroot-windows ] && mv sysroot-windows pkg/sysroots/windows-mingw
+          [ -d sysroot-macos ] && mv sysroot-macos pkg/sysroots/macos-sdk
+
+          # Linux
+          cat > pkg/toolchains/linux.sh << 'EOF'
+          llc -mtriple=x86_64-linux-musl "$1" -filetype=obj -o out.o &&
+          ld.lld --sysroot=../sysroots/linux-musl out.o -o a.out -lc
+          EOF
+
+          # Windows
+          cat > pkg/toolchains/windows.sh << 'EOF'
+          llc -mtriple=x86_64-w64-windows-gnu "$1" -filetype=obj -o out.obj &&
+          lld-link out.obj /OUT:a.exe /LIBPATH:../sysroots/windows-mingw/lib kernel32.lib
+          EOF
+
+          # macOS
+          cat > pkg/toolchains/macos.sh << 'EOF'
+          llc -mtriple=x86_64-apple-darwin "$1" -filetype=obj -o out.o &&
+          ld64.lld -syslibroot ../sysroots/macos-sdk out.o -o a.out -lSystem
+          EOF
+
+          chmod +x pkg/toolchains/*.sh
+
+      # ==========================
+      # 8. ZIP ONLY (NO installers)
+      # ==========================
+      - name: Package ZIP ONLY
+        shell: bash
+        run: |
           zip -r llvm-engine-${{ matrix.os }}.zip pkg/
-      
-      - name: Upload Artifact
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: llvm-engine-${{ matrix.os }}
           path: llvm-engine-${{ matrix.os }}.zip
 
+  # ==========================
+  # 9. Release
+  # ==========================
   release:
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Download all artifacts
+
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./release-files
+          path: release
           merge-multiple: true
 
-      - name: Create Auto-Incremented Release
+      - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find last tag or start at llvm0
-          LATEST_TAG=$(gh release list --limit 1 | awk '{print $1}')
-          if [ -z "$LATEST_TAG" ]; then
-            NEW_TAG="llvm1"
-          else
-            NUMBER=$(echo $LATEST_TAG | sed 's/llvm//')
-            NEW_NUMBER=$((NUMBER + 1))
-            NEW_TAG="llvm$NEW_NUMBER"
-          fi
-          
-          gh release create "$NEW_TAG" ./release-files/*.zip \
-            --title "LLVM Engine Build ($NEW_TAG)" \
-            --notes "Automated build with cross-platform sysroots."
+          TAG=llvm-$(date +%s)
+
+          gh release create "$TAG" release/*.zip \
+            --title "LLVM Engine $TAG" \
+            --notes "Cross-platform LLVM (NO clang, includes sysroots + toolchains)"
