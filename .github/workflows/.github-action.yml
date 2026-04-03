@@ -34,7 +34,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install cmake ninja git ccache
-
+          
       # ==========================
       # 2. Cache
       # ==========================
@@ -103,7 +103,7 @@ jobs:
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
             -DLLVM_LINK_LLVM_DYLIB=ON \
             -DLLD_BUILD_TOOLS=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -203,3 +203,4 @@ jobs:
           gh release create "$TAG" release/*.zip \
             --title "LLVM Engine $TAG" \
             --notes "Cross-platform LLVM (NO clang, includes sysroots + toolchains)"
+            
