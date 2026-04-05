@@ -7,7 +7,7 @@ jobs:
   build:
     name: Build LLVM on ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: false # Ensures other OS builds continue if one fails
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Install Dependencies (Corrected for Windows/Linux LLD)
+      # 1. Install Dependencies
       - name: Install Dependencies
         shell: bash
         run: |
@@ -24,9 +24,7 @@ jobs:
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install cmake ninja ccache
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            # Windows needs the LLVM package to provide the lld linker
             choco install -y cmake ninja ccache zip llvm
-            # Add LLVM bin to PATH so 'lld' is visible to the compiler
             echo "C:\Program Files\LLVM\bin" >> $GITHUB_PATH
           fi
 
@@ -38,8 +36,8 @@ jobs:
             ~/.cache/ccache
             ~/.ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-llvm-fast-v2-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-llvm-fast-v2-
+          key: ${{ runner.os }}-llvm-fast-v3-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-llvm-fast-v3-
 
       # 3. Prepare Sysroots
       - name: Build Linux musl sysroot
@@ -69,14 +67,13 @@ jobs:
           mkdir -p sysroot-macos
           rsync -a --copy-links --exclude='*.swiftmodule' "$SDK_PATH/" sysroot-macos/ || true
 
-      # 4. FAST BUILD: Limited targets, LLD Linker, and stripped extras
+      # 4. FAST BUILD: Minimum targets and LLD linker
       - name: Build LLVM Engine
         shell: bash
         run: |
           git clone --depth=1 https://github.com/llvm/llvm-project.git
           mkdir -p build && cd build
           
-          # LLD is used on Linux and Windows. macOS uses its own fast ld64.
           LINKER_FLAG="-DLLVM_USE_LINKER=lld"
           if [[ "${{ runner.os }}" == "macOS" ]]; then LINKER_FLAG=""; fi
 
@@ -103,34 +100,27 @@ jobs:
           
           ninja install
 
-      # 5. Smart Packaging & Extension Cleanup
+      # 5. Smart Packaging & Specific Extension Cleanup
       - name: Package
         shell: bash
         run: |
           mkdir -p pkg/llvm/bin pkg/llvm/lib
-
-          # Selective Copy (Whitelisting tools prevents broken symlink errors)
           cd install/bin
           for tool in clang clang++ lld ld.lld llc opt llvm-config; do
-            # Use -a to preserve symlinks and attributes
             cp -a ${tool}* ../../pkg/llvm/bin/ 2>/dev/null || true
           done
           cd ../..
 
-          # Core headers and internal libs (Required for cross-compilation)
           cp -r install/lib/clang pkg/llvm/lib/ 2>/dev/null || true
           cp -r install/include pkg/llvm/ 2>/dev/null || true
 
-          # Targeted Deletion of unwanted extensions in pkg/llvm only
           if [[ "${{ runner.os }}" != "Windows" ]]; then
             find pkg/llvm/bin -type f -exec strip {} + || true
             find pkg/llvm -type f \( -name "*.deb" -o -name "*.pkg" \) -delete
           else
-            # Cleanup Windows Debug files and extra libs
             find pkg/llvm -type f \( -name "*.pdb" -o -name "*.exp" -o -name "*.lib" \) -delete
           fi
 
-          # Attach Sysroots (These remain untouched by the delete commands)
           [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
           [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
           [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
@@ -145,10 +135,13 @@ jobs:
 
   release:
     needs: build
+    if: always() && contains(needs.build.result, 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4 # Crucial for gh CLI to find the repo context
+
       - uses: actions/download-artifact@v4
         with:
           path: ./release-files
@@ -158,11 +151,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # gh CLI now works because checkout provided the git context
           LATEST_TAG=$(gh release list --limit 1 | awk '{print $1}')
           [ -z "$LATEST_TAG" ] && LATEST_TAG="llvm0"
+          
           NUMBER=$(echo $LATEST_TAG | sed 's/[^0-9]*//g')
+          [ -z "$NUMBER" ] && NUMBER=0
           NEW_TAG="llvm$((NUMBER + 1))"
           
-          gh release create "$NEW_TAG" ./release-files/*.zip \
-            --title "LLVM Engine Trimmed ($NEW_TAG)" \
-            --notes "Optimized Release build (X86, AArch64). Bundled with Cross-Sysroots."
+          if [ -d "./release-files" ] && [ "$(ls -A ./release-files)" ]; then
+            gh release create "$NEW_TAG" ./release-files/*.zip \
+              --title "LLVM Engine Trimmed ($NEW_TAG)" \
+              --notes "Optimized Release build. "
+          else
+            echo "No artifacts found. Skipping release."
+            exit 1
+          fi
