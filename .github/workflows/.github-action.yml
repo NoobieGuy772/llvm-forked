@@ -35,10 +35,10 @@ jobs:
             ~/.cache/ccache
             ~/.ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-llvm-super-trimmed-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-llvm-super-trimmed-
+          key: ${{ runner.os }}-llvm-no-wasm-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-llvm-no-wasm-
 
-      # 3. Prepare Sysroots (For Cross-Compilation)
+      # 3. Prepare Sysroots
       - name: Build Linux musl sysroot
         if: runner.os == 'Linux'
         run: |
@@ -66,7 +66,7 @@ jobs:
           mkdir -p sysroot-macos
           rsync -a --copy-links --exclude='*.swiftmodule' "$SDK_PATH/" sysroot-macos/ || true
 
-      # 4. Clone & Build LLVM (Aggressive Trimming + WASM)
+      # 4. Clone & Build LLVM (X86 and AArch64 only)
       - name: Build LLVM Engine
         shell: bash
         run: |
@@ -75,7 +75,7 @@ jobs:
           cmake -G Ninja ../llvm-project/llvm \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;WebAssembly" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
             -DBUILD_SHARED_LIBS=OFF \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
             -DLLVM_LINK_LLVM_DYLIB=OFF \
@@ -91,35 +91,38 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=../install
           ninja install
 
-      # 5. Post-Build Aggressive Trimming
-      - name: Post-Build Trimming
-        shell: bash
-        run: |
-          cd install
-          # Remove non-essential binaries (Keeping core tools)
-          find bin -type f ! -name "clang*" ! -name "lld*" ! -name "llvm-config*" ! -name "llc*" ! -name "opt*" -delete
-          
-          if [[ "${{ runner.os }}" != "Windows" ]]; then
-            find bin -type f -exec strip {} + || true
-            find lib -name "*.a" -exec strip --strip-unneeded {} + || true
-          else
-            # Remove Windows Debug Symbols and heavy unused libs
-            find . -name "*.pdb" -delete
-            find . -name "*.exp" -delete
-          fi
-          
-          # Remove unnecessary includes/docs
-          rm -rf share/man share/doc include/llvm/Testing
-
-      # 6. Final Packaging (LLVM + Sysroots)
+      # 5. Smart Packaging (Prevents "No such file" errors)
       - name: Package
         shell: bash
         run: |
-          mkdir -p pkg/llvm
-          cp -r install/* pkg/llvm/
+          mkdir -p pkg/llvm/bin pkg/llvm/lib
+
+          # Selective copy to avoid broken symlinks and bloat
+          # We only grab the necessary drivers
+          cd install/bin
+          for tool in clang clang++ lld ld.lld llc opt llvm-config; do
+            # Use -a to preserve links and attributes safely
+            cp -a ${tool}* ../../pkg/llvm/bin/ 2>/dev/null || true
+          done
+          cd ../..
+
+          # Copy clang internal headers (required for compilation)
+          cp -r install/lib/clang pkg/llvm/lib/ 2>/dev/null || true
+          cp -r install/include pkg/llvm/ 2>/dev/null || true
+
+          # Strip binaries to minimize size
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            find pkg/llvm/bin -type f -exec strip {} + || true
+          else
+            find pkg/llvm -name "*.pdb" -delete
+            find pkg/llvm -name "*.exp" -delete
+          fi
+
+          # Add Sysroots
           [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
           [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
           [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
+
           zip -r llvm-cross-engine-${{ matrix.os }}.zip pkg/
 
       - name: Upload Artifact
@@ -147,7 +150,6 @@ jobs:
           if [ -z "$LATEST_TAG" ]; then
             NEW_TAG="llvm1"
           else
-            # Extract number and increment safely
             NUMBER=$(echo $LATEST_TAG | sed 's/[^0-9]*//g')
             [ -z "$NUMBER" ] && NUMBER=0
             NEW_NUMBER=$((NUMBER + 1))
@@ -155,5 +157,5 @@ jobs:
           fi
           
           gh release create "$NEW_TAG" ./release-files/*.zip \
-            --title "LLVM Cross Engine Trimmed ($NEW_TAG)" \
-            --notes "Statically linked MinSizeRel build with X86, AArch64, WebAssembly and Sysroots."
+            --title "LLVM Engine Trimmed ($NEW_TAG)" \
+            --notes "Statically linked MinSizeRel build with X86, AArch64, and Cross-Sysroots."
