@@ -1,4 +1,4 @@
-name: Cross-Platform LLVM Engine + Sysroots
+name: Super-Trimmed LLVM Engine + Cross-Sysroots
 
 on:
   workflow_dispatch:
@@ -15,29 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ==========================
       # 1. Install Dependencies
-      # ==========================
-      - name: Install Dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Dependencies
+        shell: bash
         run: |
-          sudo apt update
-          sudo apt install -y ninja-build cmake build-essential git curl mingw-w64 pkg-config libssl-dev ccache zip
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt update && sudo apt install -y ninja-build cmake build-essential ccache zip mingw-w64
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install cmake ninja ccache
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            choco install -y cmake ninja ccache zip
+          fi
 
-      - name: Install Dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          choco install -y cmake ninja git mingw ccache zip llvm
-
-      - name: Install Dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake ninja git ccache
-          
-      # ==========================
-      # 2. Cache
-      # ==========================
+      # 2. Setup Caching
       - name: Restore Cache
         uses: actions/cache@v4
         with:
@@ -45,162 +35,125 @@ jobs:
             ~/.cache/ccache
             ~/.ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-llvm-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-llvm-
+          key: ${{ runner.os }}-llvm-super-trimmed-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-llvm-super-trimmed-
 
-      # ==========================
-      # 3. Sysroots
-      # ==========================
+      # 3. Prepare Sysroots (For Cross-Compilation)
       - name: Build Linux musl sysroot
         if: runner.os == 'Linux'
         run: |
           git clone --depth=1 https://github.com/ifduyue/musl
-          cd musl
-          ./configure --prefix=$PWD/../sysroot-linux
-          make -j$(nproc)
-          make install
+          cd musl && ./configure --prefix=$PWD/../sysroot-linux
+          make -j$(nproc) && make install
 
       - name: Prepare Windows MinGW sysroot
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $paths = @("C:\mingw64","C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64","C:\tools\mingw64")
-          foreach ($p in $paths) {
-            if (Test-Path "$p\bin") {
-              mkdir sysroot-windows -Force
-              Copy-Item "$p\*" "sysroot-windows" -Recurse -Force
-              break
-            }
+          $PathsToTry = @("C:\mingw64", "C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64", "C:\tools\mingw64")
+          foreach ($path in $PathsToTry) {
+              if (Test-Path "$path\bin") {
+                  mkdir sysroot-windows -Force
+                  xcopy /E /I /H /Y "$path\*" "sysroot-windows\"
+                  break
+              }
           }
 
-      - name: Prepare macOS sysroot
+      - name: Prepare macOS SDK sysroot
         if: runner.os == 'macOS'
         run: |
-          SDK=$(xcrun --show-sdk-path)
-          mkdir sysroot-macos
-          rsync -a --copy-links "$SDK/" sysroot-macos/ || true
+          SDK_PATH=$(xcrun --show-sdk-path)
+          mkdir -p sysroot-macos
+          rsync -a --copy-links --exclude='*.swiftmodule' "$SDK_PATH/" sysroot-macos/ || true
 
-      # ==========================
-      # 4. Clone LLVM
-      # ==========================
-      - name: Clone LLVM
-        run: git clone --depth=1 https://github.com/llvm/llvm-project.git
-
-      # ==========================
-      # 5. Build LLVM (NO CLANG)
-      # ==========================
-      - name: Build LLVM
+      # 4. Clone & Build LLVM (Aggressive Trimming + WASM)
+      - name: Build LLVM Engine
         shell: bash
         run: |
-          mkdir build && cd build
-
+          git clone --depth=1 https://github.com/llvm/llvm-project.git
+          mkdir -p build && cd build
           cmake -G Ninja ../llvm-project/llvm \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_ENABLE_PROJECTS="lld" \
-            -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" \
-            -DLLVM_BUILD_TOOLS=ON \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;WebAssembly" \
+            -DBUILD_SHARED_LIBS=OFF \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DLLD_BUILD_TOOLS=ON \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX=../install
-
           ninja install
 
-      # ==========================
-      # 6. Strip Binaries
-      # ==========================
-      - name: Strip (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          find install/bin -type f -exec strip --strip-all {} + || true
-
-      - name: Strip (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          Get-ChildItem install/bin/*.exe | ForEach-Object {
-            strip $_.FullName
-          }
-
-      # ==========================
-      # 7. Toolchains (Cross Linking)
-      # ==========================
-      - name: Create Toolchains
+      # 5. Post-Build Aggressive Trimming
+      - name: Post-Build Trimming
         shell: bash
         run: |
-          mkdir -p pkg/toolchains pkg/sysroots pkg/llvm
+          cd install
+          # Remove non-essential binaries (Keeping core tools)
+          find bin -type f ! -name "clang*" ! -name "lld*" ! -name "llvm-config*" ! -name "llc*" ! -name "opt*" -delete
+          
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            find bin -type f -exec strip {} + || true
+            find lib -name "*.a" -exec strip --strip-unneeded {} + || true
+          else
+            # Remove Windows Debug Symbols and heavy unused libs
+            find . -name "*.pdb" -delete
+            find . -name "*.exp" -delete
+          fi
+          
+          # Remove unnecessary includes/docs
+          rm -rf share/man share/doc include/llvm/Testing
 
+      # 6. Final Packaging (LLVM + Sysroots)
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p pkg/llvm
           cp -r install/* pkg/llvm/
+          [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
+          [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
+          [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
+          zip -r llvm-cross-engine-${{ matrix.os }}.zip pkg/
 
-          [ -d sysroot-linux ] && mv sysroot-linux pkg/sysroots/linux-musl
-          [ -d sysroot-windows ] && mv sysroot-windows pkg/sysroots/windows-mingw
-          [ -d sysroot-macos ] && mv sysroot-macos pkg/sysroots/macos-sdk
-
-          # Linux
-          cat > pkg/toolchains/linux.sh << 'EOF'
-          llc -mtriple=x86_64-linux-musl "$1" -filetype=obj -o out.o &&
-          ld.lld --sysroot=../sysroots/linux-musl out.o -o a.out -lc
-          EOF
-
-          # Windows
-          cat > pkg/toolchains/windows.sh << 'EOF'
-          llc -mtriple=x86_64-w64-windows-gnu "$1" -filetype=obj -o out.obj &&
-          lld-link out.obj /OUT:a.exe /LIBPATH:../sysroots/windows-mingw/lib kernel32.lib
-          EOF
-
-          # macOS
-          cat > pkg/toolchains/macos.sh << 'EOF'
-          llc -mtriple=x86_64-apple-darwin "$1" -filetype=obj -o out.o &&
-          ld64.lld -syslibroot ../sysroots/macos-sdk out.o -o a.out -lSystem
-          EOF
-
-          chmod +x pkg/toolchains/*.sh
-
-      # ==========================
-      # 8. ZIP ONLY (NO installers)
-      # ==========================
-      - name: Package ZIP ONLY
-        shell: bash
-        run: |
-          zip -r llvm-engine-${{ matrix.os }}.zip pkg/
-
-      - name: Upload
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: llvm-engine-${{ matrix.os }}
-          path: llvm-engine-${{ matrix.os }}.zip
+          path: llvm-cross-engine-${{ matrix.os }}.zip
 
-  # ==========================
-  # 9. Release
-  # ==========================
   release:
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: release
+          path: ./release-files
           merge-multiple: true
 
-      - name: Create Release
+      - name: Create Auto-Incremented Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=llvm-$(date +%s)
-
-          gh release create "$TAG" release/*.zip \
-            --title "LLVM Engine $TAG" \
-            --notes "Cross-platform LLVM (NO clang, includes sysroots + toolchains)"
-            
+          LATEST_TAG=$(gh release list --limit 1 | awk '{print $1}')
+          if [ -z "$LATEST_TAG" ]; then
+            NEW_TAG="llvm1"
+          else
+            # Extract number and increment safely
+            NUMBER=$(echo $LATEST_TAG | sed 's/[^0-9]*//g')
+            [ -z "$NUMBER" ] && NUMBER=0
+            NEW_NUMBER=$((NUMBER + 1))
+            NEW_TAG="llvm$NEW_NUMBER"
+          fi
+          
+          gh release create "$NEW_TAG" ./release-files/*.zip \
+            --title "LLVM Cross Engine Trimmed ($NEW_TAG)" \
+            --notes "Statically linked MinSizeRel build with X86, AArch64, WebAssembly and Sysroots."
