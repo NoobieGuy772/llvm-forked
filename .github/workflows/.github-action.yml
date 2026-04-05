@@ -15,16 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Install Dependencies
+      # 1. Install Dependencies (Using lld to speed up linking)
       - name: Install Dependencies
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
-            sudo apt update && sudo apt install -y ninja-build cmake build-essential ccache zip mingw-w64
+            sudo apt update && sudo apt install -y ninja-build cmake build-essential ccache zip mingw-w64 lld
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install cmake ninja ccache
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install -y cmake ninja ccache zip
+            choco install -y cmake ninja ccache zip lld
           fi
 
       # 2. Setup Caching
@@ -35,8 +35,8 @@ jobs:
             ~/.cache/ccache
             ~/.ccache
             ~/AppData/Local/ccache
-          key: ${{ runner.os }}-llvm-no-wasm-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-llvm-no-wasm-
+          key: ${{ runner.os }}-llvm-fast-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-llvm-fast-
 
       # 3. Prepare Sysroots
       - name: Build Linux musl sysroot
@@ -66,29 +66,33 @@ jobs:
           mkdir -p sysroot-macos
           rsync -a --copy-links --exclude='*.swiftmodule' "$SDK_PATH/" sysroot-macos/ || true
 
-      # 4. Clone & Build LLVM (X86 and AArch64 only)
+      # 4. FAST BUILD: Minimum targets, LLD linker, and no extras
       - name: Build LLVM Engine
         shell: bash
         run: |
           git clone --depth=1 https://github.com/llvm/llvm-project.git
           mkdir -p build && cd build
           cmake -G Ninja ../llvm-project/llvm \
-            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DLLVM_BUILD_LLVM_DYLIB=OFF \
-            -DLLVM_LINK_LLVM_DYLIB=OFF \
-            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BACKTRACES=OFF \
             -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_UTILS=OFF \
             -DLLVM_ENABLE_ZLIB=OFF \
             -DLLVM_ENABLE_ZSTD=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_INSTALL_PREFIX=../install
+          
           ninja install
 
       # 5. Smart Packaging (Prevents "No such file" errors)
@@ -97,28 +101,26 @@ jobs:
         run: |
           mkdir -p pkg/llvm/bin pkg/llvm/lib
 
-          # Selective copy to avoid broken symlinks and bloat
-          # We only grab the necessary drivers
+          # Copy only the essentials (avoids broken symlinks)
           cd install/bin
           for tool in clang clang++ lld ld.lld llc opt llvm-config; do
-            # Use -a to preserve links and attributes safely
             cp -a ${tool}* ../../pkg/llvm/bin/ 2>/dev/null || true
           done
           cd ../..
 
-          # Copy clang internal headers (required for compilation)
+          # Core headers/libs needed for the engine to function
           cp -r install/lib/clang pkg/llvm/lib/ 2>/dev/null || true
           cp -r install/include pkg/llvm/ 2>/dev/null || true
 
-          # Strip binaries to minimize size
+          # Strip and Remove extensions
           if [[ "${{ runner.os }}" != "Windows" ]]; then
             find pkg/llvm/bin -type f -exec strip {} + || true
+            find pkg/llvm -type f \( -name "*.deb" -o -name "*.pkg" \) -delete
           else
-            find pkg/llvm -name "*.pdb" -delete
-            find pkg/llvm -name "*.exp" -delete
+            find pkg/llvm -type f \( -name "*.pdb" -o -name "*.exp" -o -name "*.lib" \) -delete
           fi
 
-          # Add Sysroots
+          # Attach Sysroots
           [ -d sysroot-linux ] && cp -r sysroot-linux pkg/
           [ -d sysroot-windows ] && cp -r sysroot-windows pkg/
           [ -d sysroot-macos ] && cp -r sysroot-macos pkg/
@@ -147,15 +149,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LATEST_TAG=$(gh release list --limit 1 | awk '{print $1}')
-          if [ -z "$LATEST_TAG" ]; then
-            NEW_TAG="llvm1"
-          else
-            NUMBER=$(echo $LATEST_TAG | sed 's/[^0-9]*//g')
-            [ -z "$NUMBER" ] && NUMBER=0
-            NEW_NUMBER=$((NUMBER + 1))
-            NEW_TAG="llvm$NEW_NUMBER"
-          fi
+          [ -z "$LATEST_TAG" ] && LATEST_TAG="llvm0"
+          NUMBER=$(echo $LATEST_TAG | sed 's/[^0-9]*//g')
+          NEW_TAG="llvm$((NUMBER + 1))"
           
           gh release create "$NEW_TAG" ./release-files/*.zip \
             --title "LLVM Engine Trimmed ($NEW_TAG)" \
-            --notes "Statically linked MinSizeRel build with X86, AArch64, and Cross-Sysroots."
+            --notes "Optimized Release build (X86, AArch64). Stripped and bundled with Sysroots."
